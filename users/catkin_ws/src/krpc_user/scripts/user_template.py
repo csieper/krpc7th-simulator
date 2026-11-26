@@ -179,9 +179,13 @@ class UserTemplate:
         if q is None:
             return None
 
+        header = getattr(pose_container, 'header', None)
+        frame_id = getattr(header, 'frame_id', '') if header else ''
+
         return {
             'position': p,
-            'quaternion': q
+            'quaternion': q,
+            'frame_id': frame_id
         }
 
     def __callback_navigation(self, msg):
@@ -206,6 +210,7 @@ class UserTemplate:
             self.__nav_data = {
                 'position': pose_data['position'],
                 'quaternion': pose_data['quaternion'],
+                'frame_id': pose_data['frame_id'],
                 'sequence': self.__nav_sequence,
                 'receive_time': now
             }
@@ -333,6 +338,8 @@ class UserTemplate:
         return res.success
 
     def __notify_checkpoint_passed(self, checkpoint_id):
+        notify_start_time = time.time()
+
         rospy.loginfo(
             'Passing checkpoint %d',
             checkpoint_id
@@ -350,6 +357,12 @@ class UserTemplate:
                 rospy.Duration(0.2)
             ):
                 result = self.__checkpoint_client.get_result()
+
+                rospy.loginfo(
+                    '[TIME] checkpoint=%d notification=%.2f sec',
+                    checkpoint_id,
+                    time.time() - notify_start_time
+                )
 
                 rospy.loginfo(
                     'checkpoint %d result: %s',
@@ -530,6 +543,7 @@ class UserTemplate:
     # --------------------------------------------------
 
     def __move_to_checkpoint(self, checkpoint):
+        move_start_time = time.time()
         position = checkpoint['position']
         quaternion = checkpoint['quaternion']
         checkpoint_id = checkpoint['checkpoint_id']
@@ -583,6 +597,12 @@ class UserTemplate:
                     result_type = result.type
 
                     rospy.loginfo(
+                        '[TIME] checkpoint=%d movement=%.2f sec',
+                        checkpoint_id,
+                        time.time() - move_start_time
+                    )
+
+                    rospy.loginfo(
                         'Checkpoint %d movement result: %s',
                         checkpoint_id,
                         result
@@ -610,6 +630,21 @@ class UserTemplate:
             )
             return False
 
+        nav_state = self.__get_navigation_state()
+        if nav_state is None:
+            rospy.logerr('[NAV] No navigation data before movement')
+            return False
+
+        nav_frame = nav_state.get('frame_id', '')
+        rospy.loginfo('[NAV] frame_id=%s', nav_frame)
+
+        if nav_frame != 'iss_body':
+            rospy.logerr(
+                '[NAV] Frame mismatch: navigation=%s target=iss_body. Stop movement.',
+                nav_frame
+            )
+            return False
+
         for attempt in range(NAV_RETRY_LIMIT + 1):
             if rospy.is_shutdown():
                 return False
@@ -627,58 +662,15 @@ class UserTemplate:
             if success:
                 return True
 
-            # 不是 INVALID_NAV，不盲目當成導航中斷處理
-            if result_type != CtlCommandResult.INVALID_NAV:
-                rospy.logerr(
-                    '[MOVE] checkpoint=%d failed with result=%s',
-                    checkpoint_id,
-                    result_type
-                )
-                return False
-
-            rospy.logwarn(
-                '[NAV] checkpoint=%d INVALID_NAV on attempt %d',
+            rospy.logerr(
+                '[MOVE] checkpoint=%d failed with result=%s',
                 checkpoint_id,
-                attempt + 1
+                result_type
             )
-
-            self.__log_navigation_state(
-                'INVALID_NAV at checkpoint %d' % checkpoint_id
-            )
-
-            if attempt >= NAV_RETRY_LIMIT:
-                break
-
-            # 記錄失敗當下的序號，要求後續收到新導航資料
-            failed_sequence = self.__get_navigation_sequence()
-
-            rospy.logwarn(
-                '[NAV] Waiting for navigation recovery after sequence %d',
-                failed_sequence
-            )
-
-            recovered = self.__wait_navigation_ready(
-                after_sequence=failed_sequence,
-                timeout=NAV_RECOVERY_TIMEOUT
-            )
-
-            if not recovered:
-                rospy.logerr(
-                    '[NAV] checkpoint=%d recovery failed; stop retry',
-                    checkpoint_id
-                )
-                return False
-
-            rospy.loginfo(
-                '[NAV] Recovered. Retrying checkpoint %d',
-                checkpoint_id
-            )
+            return False
 
         return False
 
-    # --------------------------------------------------
-    # Main flow
-    # --------------------------------------------------
 
     def __run_user_flow(self):
         try:
